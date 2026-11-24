@@ -1,0 +1,100 @@
+name: PLE GHA probe - stage 2 eval engineers-estimate-check
+
+# Stage 2 probe — prepared 2026-11-24 after stage 1 passed (110 GB free disk).
+# Runs ONE dev task (engineers-estimate-check, 1 attempt, 1 trial) end to end.
+# Model route: the Codespace-proven scratch config (deepseek-v4.1-flash-free via
+# 100milionseek) applied by sed to the CHECKED-OUT COPY of the entry only; the
+# repo's canonical submission.yaml (Coarena gemini-3-8-flash) stays untouched.
+# The same key doubles as the LLM-judge key via run.py's own-model fallback.
+# Requires repo secrets: HF_TOKEN (HF read token) + MODEL_API_KEY (100milionseek key).
+# Hosted-runner job cap is 6h; the task limit is 360 min, so timeout-minutes is
+# 350 to fail under our control and let the always() harvest/upload steps run.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    name: Eval engineers-estimate-check on Actions
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Remove large preinstalled toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+          docker image prune -af
+          docker builder prune -af
+          df -h
+
+      - name: Checkout entry
+        uses: actions/checkout@v4
+        with:
+          path: ple-entry
+
+      - name: Checkout kit (google-research/ple)
+        uses: actions/checkout@v4
+        with:
+          repository: google-research/ple
+          path: ple-kit
+
+      - name: Point the entry copy at the scratch model route
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i 's|^model_api:.*|model_api: openai-compatible/deepseek-v4.1-flash-free|' ple-entry/submission.yaml
+          sed -i 's|^model_base_url:.*|model_base_url: https://100milionseek.top/v1|' ple-entry/submission.yaml
+          grep -E '^(model_api|model_base_url):' ple-entry/submission.yaml
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv and pinned Harbor
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade uv
+          uv tool install harbor==0.20.0 --with websockets --python 3.12 --force
+          export PATH="$HOME/.local/bin:$PATH"
+          harbor --version
+
+      - name: Write local.env from secrets (values never printed)
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          {
+            echo "HF_TOKEN=${HF_TOKEN}"
+            echo "MODEL_API_KEY=${MODEL_API_KEY}"
+          } > ple-kit/local.env
+          echo "local.env written ($(wc -l < ple-kit/local.env) lines, values hidden)"
+
+      - name: Run eval (single task, 1 attempt, 1 trial)
+        shell: bash
+        run: |
+          set -uo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          cd ple-kit
+          mkdir -p "$GITHUB_WORKSPACE/run-output"
+          uv run python eval/run.py "$GITHUB_WORKSPACE/ple-entry" \
+            --env-file local.env \
+            --tasks engineers-estimate-check \
+            --attempts 1 --trials 1 \
+            2>&1 | tee "$GITHUB_WORKSPACE/run-output/eval-console.log"
+          echo "run.py exit: ${PIPESTATUS[0]}"
+
+      - name: Harvest container logs (before anything is torn down)
