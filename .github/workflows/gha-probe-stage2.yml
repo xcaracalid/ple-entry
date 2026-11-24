@@ -98,3 +98,25 @@ jobs:
           echo "run.py exit: ${PIPESTATUS[0]}"
 
       - name: Harvest container logs (before anything is torn down)
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/run-output/container-logs"
+          for c in $(docker ps -a --format '{{.Names}}'); do
+            docker logs "$c" > "$GITHUB_WORKSPACE/run-output/container-logs/${c}.log" 2>&1 || true
+          done
+          docker ps -a > "$GITHUB_WORKSPACE/run-output/container-logs/docker-ps.txt" 2>&1 || true
+          df -h > "$GITHUB_WORKSPACE/run-output/df-final.txt" 2>&1 || true
+
+      - name: Upload run output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ple-stage2-run-output
+          path: |
+            run-output/
+            ple-kit/**/results.json
+            ple-kit/**/harbor.log
+          if-no-files-found: warn
+          retention-days: 14
