@@ -55,6 +55,18 @@ WRAP_UP = {
     "content": "Time is up for this step. Stop and reply with your answer.",
 }
 RESULT_CHARS = 20_000  # a longer tool result loses its middle
+# Per-call request budget, enforced by compact() before every model call.
+# Measured 2026-11-24/25: with no budget, the worker conversation grew until
+# late calls uploaded ~3.3 MB each (110 MB over 79 calls), the route's
+# median call took 245 s, and both stage-2 runs died at the 350-minute
+# Actions cap. Compaction pins the system prompt and the first user message
+# (the task, plus the plan for the worker) verbatim, and shrinks older
+# material first; the newest turns are touched only as a last resort.
+MAX_REQUEST_BYTES = 400_000  # serialized messages + tool defs, per call
+RECENT_KEEP = 8  # newest messages compaction never touches
+OLD_RESULT_KEEP = 600  # chars an older tool result keeps once compacted
+OLD_TEXT_KEEP = 2_000  # chars an older assistant reply keeps once compacted
+OLD_ARG_KEEP = 1_000  # chars a string in old tool-call arguments keeps
 # Seconds between retries once the SDK's own quick retries are exhausted.
 RETRY_WAITS = (5, 15, 30, 60, 120)
 # How endpoints word a 400 saying the conversation no longer fits the context
@@ -616,6 +628,143 @@ async def shorten(session, messages):
   return True
 
 
+def _payload_bytes(messages, tools):
+  """Returns the serialized size of one model request, in bytes."""
+  total = len(json.dumps(messages, ensure_ascii=False, default=str).encode())
+  if tools:
+    total += len(json.dumps(tools, ensure_ascii=False, default=str).encode())
+  return total
+
+
+def _middle_shrink(text, keep, note):
+  """Keeps the head and tail of `text`, replacing the middle with a note."""
+  if len(text) <= keep:
+    return text
+  half = keep // 2
+  return (
+      f"{text[:half]}\n[... {note}: {len(text) - keep} characters removed"
+      f" ...]\n{text[-half:]}"
+  )
+
+
+def _elide_args(arguments):
+  """Shrinks long strings inside a tool call's JSON arguments.
+
+  A `write_file` call's `content` is the worst case: the full file text
+  sits in the conversation and is re-sent on every later call, although the
+  model can re-read the file. Long strings are replaced by a note giving
+  their length; the call's shape and id are unchanged, so the pairing with
+  its tool result stays valid.
+
+  Args:
+    arguments: The tool call's arguments, as a JSON string.
+
+  Returns:
+    The arguments with long string values elided, or the input unchanged.
+  """
+  try:
+    args = json.loads(arguments or "{}")
+  except ValueError:
+    return arguments
+  if not isinstance(args, dict):
+    return arguments
+
+  def shrink(value):
+    if isinstance(value, str) and len(value) > OLD_ARG_KEEP:
+      return (
+          f"[... elided to save context: {len(value)} characters; re-read"
+          " the file or re-run the tool if you need them]"
+      )
+    if isinstance(value, dict):
+      return {k: shrink(v) for k, v in value.items()}
+    if isinstance(value, list):
+      return [shrink(v) for v in value]
+    return value
+
+  shrunk = shrink(args)
+  return arguments if shrunk == args else json.dumps(shrunk, allow_nan=False)
+
+
+async def compact(session, messages, tools):
+  """Shrinks older conversation material until the request fits the budget.
+
+  The system prompt and the first user message (the task, plus the plan for
+  the worker and verifier) are pinned verbatim, and the newest `RECENT_KEEP`
+  messages are shrunk only as a last resort. Older material is shrunk first
+  — tool results, then long strings in tool-call arguments, then assistant
+  replies — then the oldest whole turns are dropped (an assistant call
+  together with its tool results, so pairing stays valid), and only then is
+  the recent window shrunk. If the pinned head and the tool definitions
+  alone exceeded the budget, they would be sent as is: correctness beats
+  the budget.
+
+  Args:
+    session: Active `taskbridge.Session` for the task.
+    messages: The conversation, modified in place.
+    tools: The tool definitions the call will send.
+
+  Returns:
+    Whether anything was shrunk or dropped.
+  """
+  if _payload_bytes(messages, tools) <= MAX_REQUEST_BYTES:
+    return False
+  start = _payload_bytes(messages, tools)
+
+  def over():
+    return _payload_bytes(messages, tools) > MAX_REQUEST_BYTES
+
+  def shrink(indices):
+    """Shrinks tool results, call arguments, then replies at `indices`."""
+    # tool results keep only their head and tail
+    for n in indices:
+      if not over():
+        return
+      m = messages[n]
+      if m["role"] == "tool" and isinstance(m.get("content"), str):
+        m["content"] = _middle_shrink(
+            m["content"], OLD_RESULT_KEEP, "compacted to save context"
+        )
+    # long strings in tool-call arguments are elided (a backstop: agent()
+    # already elides a turn's arguments once its calls have run)
+    for n in indices:
+      if not over():
+        return
+      m = messages[n]
+      if m["role"] == "assistant":
+        for call in m.get("tool_calls") or ():
+          fn = call.get("function") or {}
+          if isinstance(fn.get("arguments"), str):
+            fn["arguments"] = _elide_args(fn["arguments"])
+    # assistant replies keep only their head and tail
+    for n in indices:
+      if not over():
+        return
+      m = messages[n]
+      if m["role"] == "assistant" and isinstance(m.get("content"), str):
+        m["content"] = _middle_shrink(
+            m["content"], OLD_TEXT_KEEP, "compacted to save context"
+        )
+
+  shrink(range(2, max(2, len(messages) - RECENT_KEEP)))
+  # drop the oldest whole turns (an assistant call together with its tool
+  # results, so pairing stays valid) until the request fits
+  while over() and len(messages) - RECENT_KEEP > 2:
+    end = 3
+    if messages[2]["role"] == "assistant" and messages[2].get("tool_calls"):
+      while end < len(messages) and messages[end]["role"] == "tool":
+        end += 1
+    del messages[2:end]
+  if over():
+    # last resort: shrink the recent window too; the pinned head stays
+    shrink(range(2, len(messages)))
+  await session.log(
+      f"context budget: compacted {start} ->"
+      f" {_payload_bytes(messages, tools)} bytes (budget"
+      f" {MAX_REQUEST_BYTES})"
+  )
+  return True
+
+
 def conversation(system, session, prompt):
   """Creates the initial `[system, user]` message list for a role.
 
@@ -658,6 +807,7 @@ async def agent(session, messages, tools, until, final=False):
     wrap_up = left is not None and left < until
     if wrap_up and messages[-1:] != [WRAP_UP]:  # asked once, also on a retry
       messages.append(dict(WRAP_UP))
+    await compact(session, messages, tools)
     # A call still running when the wrap-up starts is stopped. The wrap-up call
     # itself gets at most WRAP_UP_SEC and stops at the time limit; if it takes
     # longer, the step returns head, its answer so far.
@@ -734,6 +884,12 @@ async def agent(session, messages, tools, until, final=False):
       messages.append(
           {"role": "tool", "tool_call_id": call["id"], "content": content}
       )
+      # the call has run: its arguments (a write_file's content, a bash
+      # heredoc) no longer need to ride along in full — the model can
+      # re-read the file or re-run the command
+      fn = call["function"]
+      if isinstance(fn.get("arguments"), str):
+        fn["arguments"] = _elide_args(fn["arguments"])
     if left is not None:
       messages[-1]["content"] += (
           f"\n[{int((session.time_left() - until) // 60)} minutes left for this"
